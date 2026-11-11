@@ -14,11 +14,20 @@ window.PP_CONFIG = {
   SHEET_MISSION: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vS3zQJvpug9fWqSzLKWYKgVtrFzdnORyJmvOS0lnuXsfF2QmgmOORZobNFWXGvgUbSrH5UlocUAvmND/pub?gid=1328295572&single=true&output=csv',
   // 모브 종족 설정 시트 (웹에 게시한 CSV 주소)
   SHEET_MOB: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vS3zQJvpug9fWqSzLKWYKgVtrFzdnORyJmvOS0lnuXsfF2QmgmOORZobNFWXGvgUbSrH5UlocUAvmND/pub?gid=1558759656&single=true&output=csv',
+  // 지역 설정 시트 (웹에 게시한 CSV 주소) — 지역 단위로 열고 닫기
+  SHEET_AREA: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vS3zQJvpug9fWqSzLKWYKgVtrFzdnORyJmvOS0lnuXsfF2QmgmOORZobNFWXGvgUbSrH5UlocUAvmND/pub?gid=1957752367&single=true&output=csv',
   // 추첨 내역 기록용 Apps Script 웹 앱 주소 (…/exec 로 끝나는 주소를 따옴표 안에 붙여 넣기)
   LOG_URL: 'https://script.google.com/macros/s/AKfycbyv8Tm0Q6a-FzxLdlNOUi95pXhDkznm4hWFvW3IoL95HkqmzU2EzqqnormfhVhNJU8b/exec',
   // 미션 추첨 때 함께 정해지는 모브 수 (최소 ~ 최대, 랜덤)
   MOB_MIN: 1,
-  MOB_MAX: 5
+  MOB_MAX: 5,
+  // 모브 크기 확률 (그룹별 비율, 합이 100이 아니어도 됨)
+  // 시트에 '크기 비율' 열이 있으면 그 숫자를 대신 사용해요.
+  SIZE_GROUPS: [
+    { label: '작음', from: 100, to: 139, weight: 30 },
+    { label: '중간', from: 140, to: 199, weight: 50 },
+    { label: '큼',   from: 200, to: 400, weight: 20 }
+  ]
 };
 /* ============================================================== */
 </script>
@@ -304,7 +313,8 @@ window.PP_CONFIG = {
       .map(r => Object.fromEntries(header.map((h, i) => [h, (r[i] || '').trim()])));
   }
   function col(obj, prefix) {
-    const k = Object.keys(obj).find(k => norm(k).startsWith(norm(prefix)));
+    const keys = Object.keys(obj);
+    const k = keys.find(k => norm(k) === norm(prefix)) || keys.find(k => norm(k).startsWith(norm(prefix)));
     return k ? obj[k] : '';
   }
   async function loadCSV(url) {
@@ -314,7 +324,8 @@ window.PP_CONFIG = {
   }
 
   /* ───────── 데이터 ───────── */
-  let missions = [], mobPool = { size: [], personality: [], race: [] };
+  let closedAreas = new Set();
+  let missions = [], allMissions = [], mobPool = { size: [], personality: [], race: [] };
   function setMissions(rows) {
     // 장소1 / 장소2 칸이 비어 있으면 (셀 병합 등) 바로 위 행의 값을 이어서 사용
     let prevArea = '', prevPlace = '';
@@ -322,12 +333,62 @@ window.PP_CONFIG = {
       let a = col(r, '장소1'), p = col(r, '장소2');
       if (a) { if (a !== prevArea) prevPlace = ''; prevArea = a; } else a = prevArea;
       if (p) prevPlace = p; else p = prevPlace;
-      return { area: a, place: p, situation: col(r, '봉사활동 상황'), task: col(r, '활동 내용'), reward: col(r, '성공시 보상') };
+      return {
+        area: a, place: p, situation: col(r, '봉사활동 상황'), task: col(r, '활동 내용'), reward: col(r, '성공시 보상'),
+        open: isOpen(r)
+      };
     }).filter(m => m.area && (m.situation || m.task));
+    allMissions = missions;
+    missions = allMissions.filter(m => m.open && !closedAreas.has(norm(m.area)));
+  }
+
+  // 지역 설정 탭: 공개가 체크되지 않은 지역은 닫힘 (탭에 없는 지역은 열림)
+  function setAreas(rows) {
+    closedAreas = new Set(
+      rows.filter(r => col(r, '장소1') && !isOpen(r)).map(r => norm(col(r, '장소1')))
+    );
+  }
+
+  // '공개' 열이 있으면 체크된 미션만 공개, 열이 없으면 모두 공개
+  function isOpen(r) {
+    const key = Object.keys(r).find(k => norm(k) === '공개');
+    if (!key) return true;
+    return ['true', 'o', 'ㅇ', 'y', 'yes', '1', '공개', '✓', '✔'].includes(norm(r[key]));
   }
   function setMobs(rows) {
     const list = key => rows.map(r => col(r, key)).filter(Boolean);
     mobPool = { size: list('크기'), personality: list('성격'), race: list('종족') };
+    mobPool.sizeWeights = sizeWeights(rows, mobPool.size);
+  }
+
+  // 크기별 가중치 계산
+  function sizeWeights(rows, sizes) {
+    // 1) 시트에 '크기 비율' 열이 있으면 그 값 사용
+    const custom = rows.filter(r => col(r, '크기') && Object.keys(r).some(k => norm(k).startsWith('크기비율')));
+    if (custom.length) {
+      const key = Object.keys(rows[0]).find(k => norm(k).startsWith('크기비율'));
+      const map = {};
+      rows.forEach(r => { const s = col(r, '크기'); if (s) map[s] = parseFloat(r[key]); });
+      const w = sizes.map(s => (isFinite(map[s]) && map[s] >= 0 ? map[s] : 1));
+      if (w.some(x => x > 0)) return w;
+    }
+    // 2) 기본: 그룹 비율을 그룹 안의 칸 수로 나눠서 배분
+    const groups = CFG.SIZE_GROUPS || [];
+    const groupOf = s => {
+      const n = parseInt(String(s).match(/\d+/) || '', 10);
+      return isFinite(n) ? groups.findIndex(g => n >= g.from && n <= g.to) : -1;
+    };
+    const idx = sizes.map(groupOf);
+    const counts = groups.map((_, gi) => idx.filter(i => i === gi).length);
+    return idx.map(gi => gi < 0 ? 0 : groups[gi].weight / counts[gi]);
+  }
+
+  function pickWeighted(arr, weights) {
+    const total = weights.reduce((a, b) => a + b, 0);
+    if (!(total > 0)) return pick(arr);
+    let r = Math.random() * total;
+    for (let i = 0; i < arr.length; i++) { r -= weights[i]; if (r < 0) return arr[i]; }
+    return arr[arr.length - 1];
   }
 
   /* ───────── 상태 ───────── */
@@ -337,6 +398,13 @@ window.PP_CONFIG = {
 
   const inArea = (m, r) => !r || r.keys.includes(norm(m.area)) || norm(m.area) === norm(r.name);
   const missionsFor = (r, p) => missions.filter(m => inArea(m, r) && (!p || norm(m.place) === norm(p)));
+  const hasAny = r => allMissions.some(m => inArea(m, r));   // 닫힌 미션 포함
+
+  function areaStatus(r) {
+    const n = missionsFor(r).length;
+    if (n) return ' (' + n + ')';
+    return hasAny(r) ? ' (닫힘)' : ' (준비 중)';
+  }
 
   function renderAreaSelect() {
     const sel = $('area-select');
@@ -344,8 +412,7 @@ window.PP_CONFIG = {
     const opt = (v, t) => { const o = document.createElement('option'); o.value = v; o.textContent = t; return o; };
     sel.appendChild(opt('', '섬 전체' + (missions.length ? ' (' + missions.length + ')' : '')));
     regions.forEach(r => {
-      const n = missionsFor(r).length;
-      sel.appendChild(opt(r.id, r.name + (missions.length ? (n ? ' (' + n + ')' : ' (준비 중)') : '')));
+      sel.appendChild(opt(r.id, r.name + (allMissions.length ? areaStatus(r) : '')));
     });
     sel.value = area ? area.id : '';
   }
@@ -374,8 +441,12 @@ window.PP_CONFIG = {
     $('area-select').value = area ? area.id : '';
     renderPlaces();
     const note = $('mission-note');
-    if (!missions.length) { note.hidden = false; note.textContent = '미션을 불러오는 중이에요.'; }
-    else if (area && !missionsFor(area).length) { note.hidden = false; note.textContent = '이 구역의 미션은 준비 중이에요.'; }
+    if (!allMissions.length) { note.hidden = false; note.textContent = '미션을 불러오는 중이에요.'; }
+    else if (!missions.length) { note.hidden = false; note.textContent = '지금은 공개된 미션이 없어요.'; }
+    else if (area && !missionsFor(area).length) {
+      note.hidden = false;
+      note.textContent = hasAny(area) ? '현재 닫혀 있는 구역이에요.' : '이 구역의 미션은 준비 중이에요.';
+    }
     else if (!area) { note.hidden = false; note.textContent = '지도에서 구역을 누르거나 장소1을 고르면 장소2도 고를 수 있어요.'; }
     else note.hidden = true;
     updateRollBtn();
@@ -469,7 +540,7 @@ window.PP_CONFIG = {
     const lo = Math.max(1, CFG.MOB_MIN || 1), hi = Math.max(lo, CFG.MOB_MAX || 5);
     const count = lo + Math.floor(Math.random() * (hi - lo + 1));
     lastMobs = Array.from({ length: count }, () => ({
-      size: size.length ? pick(size) : '', personality: personality.length ? pick(personality) : '', race: pick(race)
+      size: size.length ? pickWeighted(size, mobPool.sizeWeights || []) : '', personality: personality.length ? pick(personality) : '', race: pick(race)
     }));
     const ul = $('mob-list');
     const show = () => {
@@ -531,9 +602,11 @@ window.PP_CONFIG = {
 
   /* ───────── 시작 ───────── */
   renderAreaSelect(); render();
-  Promise.allSettled([loadCSV(CFG.SHEET_MISSION), loadCSV(CFG.SHEET_MOB)]).then(([m, b]) => {
+  const areaReq = CFG.SHEET_AREA ? loadCSV(CFG.SHEET_AREA) : Promise.resolve([]);
+  Promise.allSettled([loadCSV(CFG.SHEET_MISSION), loadCSV(CFG.SHEET_MOB), areaReq]).then(([m, b, a]) => {
     const okM = m.status === 'fulfilled' && m.value.length;
     const okB = b.status === 'fulfilled' && b.value.length;
+    if (a.status === 'fulfilled') setAreas(a.value);
     setMissions(okM ? m.value : window.PP_FALLBACK.missions);
     setMobs(okB ? b.value : window.PP_FALLBACK.mobs);
     $('status').classList.toggle('live', !!(okM && okB));
