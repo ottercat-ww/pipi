@@ -16,7 +16,8 @@ window.PP_CONFIG = {
   SHEET_MOB: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vS3zQJvpug9fWqSzLKWYKgVtrFzdnORyJmvOS0lnuXsfF2QmgmOORZobNFWXGvgUbSrH5UlocUAvmND/pub?gid=1558759656&single=true&output=csv',
   // 추첨 내역 기록용 Apps Script 웹 앱 주소 (…/exec 로 끝나는 주소를 따옴표 안에 붙여 넣기)
   LOG_URL: 'https://script.google.com/macros/s/AKfycbyv8Tm0Q6a-FzxLdlNOUi95pXhDkznm4hWFvW3IoL95HkqmzU2EzqqnormfhVhNJU8b/exec',
-  // 한 번에 추첨할 수 있는 최대 모브 수
+  // 미션 추첨 때 함께 정해지는 모브 수 (최소 ~ 최대, 랜덤)
+  MOB_MIN: 1,
   MOB_MAX: 5
 };
 /* ============================================================== */
@@ -136,7 +137,9 @@ window.PP_CONFIG = {
   .rolling .field-value, .rolling .mob-line { opacity: .35; filter: blur(1px); }
 
   /* 모브 */
-  .mob-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+  .mob-notice { font-size: 13px; line-height: 1.6; margin: 0; padding: 10px 12px; border: 1px dashed var(--line); border-radius: 10px; opacity: .9; }
+  .mob-empty { font-size: 13px; line-height: 1.6; opacity: .7; margin: 0; }
+  .mob-empty[hidden], .mob-notice[hidden] { display: none; }
   .stepper { display: flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; }
   .stepper button { width: 34px; height: 34px; border: none; background: none; color: var(--white); font-size: 16px; cursor: pointer; border-radius: 999px; }
   .stepper button:hover { background: rgba(255,255,255,.1); }
@@ -237,20 +240,11 @@ window.PP_CONFIG = {
 
     <section class="card" aria-live="polite">
       <div class="card-top">
-        <span>02 / MOB</span>
+        <span>02 / MOB<span id="mob-total"></span></span>
         <button class="copy-btn" id="copy-mob" type="button" hidden>COPY</button>
       </div>
-      <div class="mob-controls">
-        <span class="mob-label">함께 등장할 모브 수</span>
-        <div class="stepper">
-          <button type="button" id="mob-minus" aria-label="모브 수 줄이기">−</button>
-          <output id="mob-count">1</output>
-          <button type="button" id="mob-plus" aria-label="모브 수 늘리기">+</button>
-        </div>
-      </div>
-      <div class="btn-row">
-        <button class="btn btn-primary" id="roll-mob" type="button">모브 추첨</button>
-      </div>
+      <p class="mob-empty" id="mob-empty">미션을 추첨하면 함께 등장할 모브(1~5명)가 정해져요.</p>
+      <p class="mob-notice" id="mob-notice" hidden>해당 개체를 이용하여 로그 작성 가능. 단, 필수 아님.</p>
       <ul class="mob-list" id="mob-list"></ul>
     </section>
   </aside>
@@ -322,10 +316,14 @@ window.PP_CONFIG = {
   /* ───────── 데이터 ───────── */
   let missions = [], mobPool = { size: [], personality: [], race: [] };
   function setMissions(rows) {
-    missions = rows.map(r => ({
-      area: col(r, '장소1'), place: col(r, '장소2'),
-      situation: col(r, '봉사활동 상황'), task: col(r, '활동 내용'), reward: col(r, '성공시 보상')
-    })).filter(m => m.area && (m.situation || m.task));
+    // 장소1 / 장소2 칸이 비어 있으면 (셀 병합 등) 바로 위 행의 값을 이어서 사용
+    let prevArea = '', prevPlace = '';
+    missions = rows.map(r => {
+      let a = col(r, '장소1'), p = col(r, '장소2');
+      if (a) { if (a !== prevArea) prevPlace = ''; prevArea = a; } else a = prevArea;
+      if (p) prevPlace = p; else p = prevPlace;
+      return { area: a, place: p, situation: col(r, '봉사활동 상황'), task: col(r, '활동 내용'), reward: col(r, '성공시 보상') };
+    }).filter(m => m.area && (m.situation || m.task));
   }
   function setMobs(rows) {
     const list = key => rows.map(r => col(r, key)).filter(Boolean);
@@ -335,7 +333,7 @@ window.PP_CONFIG = {
   /* ───────── 상태 ───────── */
   let area = null;   // 선택한 장소1 (null = 섬 전체)
   let place = '';    // 선택한 장소2 ('' = 전체)
-  let lastMission = null, lastMobs = [], mobCount = 1;
+  let lastMission = null, lastMobs = [];
 
   const inArea = (m, r) => !r || r.keys.includes(norm(m.area)) || norm(m.area) === norm(r.name);
   const missionsFor = (r, p) => missions.filter(m => inArea(m, r) && (!p || norm(m.place) === norm(p)));
@@ -391,9 +389,14 @@ window.PP_CONFIG = {
   }
 
   function hideResult() {
-    lastMission = null;
+    lastMission = null; lastMobs = [];
     $('mission-result').hidden = true;
     $('copy-mission').hidden = true;
+    $('mob-list').replaceChildren();
+    $('copy-mob').hidden = true;
+    $('mob-notice').hidden = true;
+    $('mob-empty').hidden = false;
+    $('mob-total').textContent = '';
   }
 
   function selectArea(region, fromMap) {
@@ -449,13 +452,23 @@ window.PP_CONFIG = {
       $('copy-mission').hidden = false;
     };
     box.hidden ? show() : shuffleEffect(box, show);
-    logDraw({ name, area: m.area, place: m.place, situation: m.situation, task: m.task, reward: m.reward });
+
+    const mobs = rollMobs();
+    const areaName = m.area || (area ? area.name : '');
+    logDraw({
+      name, area: areaName, place: m.place, situation: m.situation, task: m.task, reward: m.reward,
+      mobs: mobs.map((mb, i) => (i + 1) + '. ' + mobText(mb)).join('\n')
+    });
   }
+
+  const mobText = mb => [mb.size, mb.personality, mb.race].filter(Boolean).join(' ');
 
   function rollMobs() {
     const { size, personality, race } = mobPool;
-    if (!race.length) return;
-    lastMobs = Array.from({ length: mobCount }, () => ({
+    if (!race.length) return [];
+    const lo = Math.max(1, CFG.MOB_MIN || 1), hi = Math.max(lo, CFG.MOB_MAX || 5);
+    const count = lo + Math.floor(Math.random() * (hi - lo + 1));
+    lastMobs = Array.from({ length: count }, () => ({
       size: size.length ? pick(size) : '', personality: personality.length ? pick(personality) : '', race: pick(race)
     }));
     const ul = $('mob-list');
@@ -468,8 +481,12 @@ window.PP_CONFIG = {
         li.appendChild(span); return li;
       }));
       $('copy-mob').hidden = false;
+      $('mob-empty').hidden = true;
+      $('mob-notice').hidden = false;
+      $('mob-total').textContent = ' / ' + lastMobs.length + '명';
     };
     ul.children.length ? shuffleEffect(ul, show) : show();
+    return lastMobs;
   }
 
   /* ───────── 복사 ───────── */
@@ -491,7 +508,7 @@ window.PP_CONFIG = {
   });
   $('copy-mob').addEventListener('click', () => {
     if (!lastMobs.length) return;
-    copy(lastMobs.map((mb, i) => `${i + 1}. ${[mb.size, mb.personality, mb.race].filter(Boolean).join(' ')}`).join('\n'));
+    copy(lastMobs.map((mb, i) => `${i + 1}. ${mobText(mb)}`).join('\n'));
   });
 
   /* ───────── 이벤트 ───────── */
@@ -499,10 +516,6 @@ window.PP_CONFIG = {
   $('name-input').addEventListener('input', updateRollBtn);
   $('area-select').addEventListener('change', e => selectArea(regions.find(r => r.id === e.target.value) || null));
   $('roll-mission').addEventListener('click', rollMission);
-  $('roll-mob').addEventListener('click', rollMobs);
-  const setCount = n => { mobCount = Math.max(1, Math.min(CFG.MOB_MAX, n)); $('mob-count').textContent = mobCount; };
-  $('mob-minus').addEventListener('click', () => setCount(mobCount - 1));
-  $('mob-plus').addEventListener('click', () => setCount(mobCount + 1));
 
   const svgNS = 'http://www.w3.org/2000/svg';
   regions.forEach(region => {
